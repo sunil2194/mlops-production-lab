@@ -18,6 +18,9 @@ jobs:
         run:  pip install -r requirements.txt
 
 
+      - name: Run Tests
+        run:  pytest
+
       - name: Run Python
         run:  python hello.py
       
