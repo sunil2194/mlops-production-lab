@@ -1,52 +1,33 @@
 
 import json
 import logging
-import time
 from datetime import datetime, timedelta
 
 import boto3
 from airflow import DAG
 from airflow.exceptions import AirflowSkipException
 from airflow.operators.python import PythonOperator
-from airflow.api.common.trigger_dag import trigger_dag
-from airflow.exceptions import DagRunAlreadyExists
-from airflow.models.dagrun import DagRun
-from airflow.utils.session import create_session
-from airflow.utils.state import DagRunState
+from airflow.providers.standard.operators.trigger_dagrun import (
+    TriggerDagRunOperator,
+)
 
 QUEUE_URL = (
     "https://sqs.us-east-1.amazonaws.com/"
     "000515319532/mlops-customer-data-events"
 )
+
 REGION = "us-east-1"
 TARGET_DAG = "customer_churn_pipeline"
 
-VISIBILITY_SECONDS = 300
-POLL_SECONDS = 10
-MAX_WAIT_SECONDS = 3600
 
-
-def get_run_state(run_id):
-    with create_session() as session:
-        run = (
-            session.query(DagRun)
-            .filter(
-                DagRun.dag_id == TARGET_DAG,
-                DagRun.run_id == run_id,
-            )
-            .first()
-        )
-        return run.state if run else None
-
-
-def process_sqs_event():
+def receive_s3_event(**context):
     sqs = boto3.client("sqs", region_name=REGION)
 
     response = sqs.receive_message(
         QueueUrl=QUEUE_URL,
         MaxNumberOfMessages=1,
         WaitTimeSeconds=10,
-        VisibilityTimeout=VISIBILITY_SECONDS,
+        VisibilityTimeout=43200,
     )
 
     messages = response.get("Messages", [])
@@ -55,7 +36,6 @@ def process_sqs_event():
         raise AirflowSkipException("No SQS messages available")
 
     message = messages[0]
-    receipt_handle = message["ReceiptHandle"]
     event = json.loads(message["Body"])
 
     if (
@@ -68,64 +48,40 @@ def process_sqs_event():
     key = event["detail"]["object"]["key"]
     event_id = event["id"]
 
-    run_id = f"s3_event__{event_id}"
+    logging.info(
+        "Received S3 event %s for s3://%s/%s",
+        event_id,
+        bucket,
+        key,
+    )
 
-    logging.info("Processing s3://%s/%s", bucket, key)
+    return {
+        "bucket": bucket,
+        "key": key,
+        "event_id": event_id,
+        "receipt_handle": message["ReceiptHandle"],
+    }
 
-    state = get_run_state(run_id)
 
-    if state == DagRunState.SUCCESS:
-        logging.info("Event already processed successfully")
+def acknowledge_sqs_message(**context):
+    event = context["ti"].xcom_pull(
+        task_ids="receive_s3_event"
+    )
 
-    elif state == DagRunState.FAILED:
-        raise RuntimeError(
-            f"Existing DAG run {run_id} failed; manual recovery required"
-        )
+    if not event:
+        raise AirflowSkipException("No event to acknowledge")
 
-    elif state is None:
-        try:
-            trigger_dag(
-                dag_id=TARGET_DAG,
-                run_id=run_id,
-                conf={
-                    "bucket": bucket,
-                    "key": key,
-                },
-            )
-            logging.info("Triggered DAG run %s", run_id)
-        except DagRunAlreadyExists:
-            logging.info("DAG run already exists: %s", run_id)
+    sqs = boto3.client("sqs", region_name=REGION)
 
-    start = time.monotonic()
+    sqs.delete_message(
+        QueueUrl=QUEUE_URL,
+        ReceiptHandle=event["receipt_handle"],
+    )
 
-    while True:
-        state = get_run_state(run_id)
-
-        if state == DagRunState.SUCCESS:
-            sqs.delete_message(
-                QueueUrl=QUEUE_URL,
-                ReceiptHandle=receipt_handle,
-            )
-            logging.info("DAG succeeded; SQS event acknowledged")
-            return
-
-        if state == DagRunState.FAILED:
-            raise RuntimeError(
-                f"Customer Churn DAG failed: {run_id}"
-            )
-
-        if time.monotonic() - start >= MAX_WAIT_SECONDS:
-            raise TimeoutError(
-                f"Timed out waiting for DAG run {run_id}"
-            )
-
-        sqs.change_message_visibility(
-            QueueUrl=QUEUE_URL,
-            ReceiptHandle=receipt_handle,
-            VisibilityTimeout=VISIBILITY_SECONDS,
-        )
-
-        time.sleep(POLL_SECONDS)
+    logging.info(
+        "SQS event %s successfully acknowledged",
+        event["event_id"],
+    )
 
 
 with DAG(
@@ -134,12 +90,33 @@ with DAG(
     schedule="* * * * *",
     catchup=False,
     max_active_runs=1,
-    max_active_tasks=1,
     tags=["mlops", "sqs", "event-driven"],
 ) as dag:
 
-    process_event = PythonOperator(
-        task_id="process_sqs_event",
-        python_callable=process_sqs_event,
-        execution_timeout=timedelta(minutes=65),
+    receive_event = PythonOperator(
+        task_id="receive_s3_event",
+        python_callable=receive_s3_event,
     )
+
+    trigger_pipeline = TriggerDagRunOperator(
+        task_id="trigger_customer_churn",
+        trigger_dag_id=TARGET_DAG,
+        trigger_run_id=(
+            "s3_event__"
+            "{{ ti.xcom_pull(task_ids='receive_s3_event')['event_id'] }}"
+        ),
+        conf={
+            "bucket": "{{ ti.xcom_pull(task_ids='receive_s3_event')['bucket'] }}",
+            "key": "{{ ti.xcom_pull(task_ids='receive_s3_event')['key'] }}",
+        },
+        wait_for_completion=True,
+        poke_interval=10,
+        skip_when_already_exists=True,
+    )
+
+    acknowledge = PythonOperator(
+        task_id="acknowledge_sqs_message",
+        python_callable=acknowledge_sqs_message,
+    )
+
+    receive_event >> trigger_pipeline >> acknowledge
