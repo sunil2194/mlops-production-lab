@@ -1,20 +1,21 @@
-from airflow import DAG
-from airflow.operators.python import PythonOperator
 from datetime import datetime
 
-
-def hello():
-    print("Hello from our GitHub-managed Airflow DAG!")
+from airflow.decorators import dag, task
 
 
-with DAG(
+@dag(
     dag_id="hello_mlops",
-    start_date=datetime(2026, 10, 7),
+    start_date=datetime(2024, 10, 13),
     schedule=None,
     catchup=False,
-) as dag:
+)
+def hello_mlops():
 
-    hello_task = PythonOperator(
-        task_id="hello",
-        python_callable=hello,
-    )
+    @task
+    def say_hello():
+        print("Hello from my first MLOps DAG!")
+
+    say_hello()
+
+
+hello_mlops()
