@@ -1,94 +1,41 @@
-
-import json
-import logging
-from datetime import datetime
+﻿from datetime import datetime
+from io import StringIO
 
 import boto3
+import pandas as pd
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.exceptions import AirflowSkipException
-from airflow.operators.trigger_dagrun import TriggerDagRunOperator
-
-QUEUE_URL = (
-    "https://sqs.us-east-1.amazonaws.com/"
-    "000515319532/mlops-customer-data-events"
-)
-REGION = "us-east-1"
 
 
-def receive_s3_event(**context):
-    sqs = boto3.client("sqs", region_name=REGION)
+def load_customer_data(**context):
+    conf = context["dag_run"].conf or {}
 
-    response = sqs.receive_message(
-        QueueUrl=QUEUE_URL,
-        MaxNumberOfMessages=1,
-        WaitTimeSeconds=10,
-        VisibilityTimeout=300,
-    )
+    bucket = conf.get("bucket", "mlops-dvc-sunil-20261007")
+    key = conf.get("key", "datasets/customer_data.csv")
 
-    messages = response.get("Messages", [])
+    print(f"Reading s3://{bucket}/{key}")
 
-    if not messages:
-        raise AirflowSkipException("No SQS messages available")
+    s3 = boto3.client("s3", region_name="us-east-1")
+    response = s3.get_object(Bucket=bucket, Key=key)
 
-    message = messages[0]
-    event = json.loads(message["Body"])
+    csv_content = response["Body"].read().decode("utf-8")
+    df = pd.read_csv(StringIO(csv_content))
 
-    if event.get("source") != "aws.s3":
-        raise ValueError("Unexpected event source")
-
-    bucket = event["detail"]["bucket"]["name"]
-    key = event["detail"]["object"]["key"]
-
-    logging.info("Received S3 event: s3://%s/%s", bucket, key)
-
-    return {
-        "bucket": bucket,
-        "key": key,
-        "receipt_handle": message["ReceiptHandle"],
-    }
-
-
-def acknowledge_message(**context):
-    event = context["ti"].xcom_pull(task_ids="receive_s3_event")
-
-    sqs = boto3.client("sqs", region_name=REGION)
-    sqs.delete_message(
-        QueueUrl=QUEUE_URL,
-        ReceiptHandle=event["receipt_handle"],
-    )
-
-    logging.info("SQS message acknowledged")
+    print("Successfully loaded customer data from S3!")
+    print("Total rows:", len(df))
+    print("Columns:", df.columns.tolist())
+    print(df.head().to_string(index=False))
 
 
 with DAG(
-    dag_id="sqs_customer_churn_listener",
-    start_date=datetime(2026, 10, 13),
-    schedule="* * * * *",
+    dag_id="customer_churn_pipeline",
+    start_date=datetime(2026, 10, 7),
+    schedule=None,
     catchup=False,
-    max_active_runs=1,
-    tags=["mlops", "sqs", "event-driven"],
+    tags=["mlops", "customer-churn"],
 ) as dag:
 
-    receive_event = PythonOperator(
-        task_id="receive_s3_event",
-        python_callable=receive_s3_event,
+    load_data = PythonOperator(
+        task_id="load_customer_data",
+        python_callable=load_customer_data,
     )
-
-    trigger_pipeline = TriggerDagRunOperator(
-        task_id="trigger_customer_churn",
-        trigger_dag_id="customer_churn_pipeline",
-        conf={
-            "bucket": "{{ ti.xcom_pull(task_ids='receive_s3_event')['bucket'] }}",
-            "key": "{{ ti.xcom_pull(task_ids='receive_s3_event')['key'] }}",
-        },
-        wait_for_completion=True,
-        poke_interval=10,
-    )
-
-    acknowledge = PythonOperator(
-        task_id="acknowledge_sqs_message",
-        python_callable=acknowledge_message,
-    )
-
-    receive_event >> trigger_pipeline >> acknowledge
