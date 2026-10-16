@@ -2,6 +2,9 @@
 from datetime import datetime
 from io import StringIO
 import logging
+import json
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 import boto3
 import pandas as pd
@@ -20,14 +23,26 @@ from sklearn.metrics import (
     recall_score,
     f1_score,
 )
-
+MLFLOW_TRACKING_URI = "http://mlflow.mlflow.svc.cluster.local:5000"
+MLFLOW_EXPERIMENT_ID = "1"
 DEFAULT_BUCKET = "mlops-dvc-sunil-20261007"
 DEFAULT_KEY = "datasets/customer_data.csv"
 
 FEATURES = ["age", "income", "balance"]
 REQUIRED = ["customer_id", *FEATURES, "left_bank"]
 
+def mlflow_api_request(endpoint, payload):
+    url = f"{MLFLOW_TRACKING_URI}/api/2.0/mlflow/{endpoint}"
 
+    request = Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    with urlopen(request, timeout=15) as response:
+        return json.loads(response.read().decode("utf-8"))
 def load_customer_data(**context):
     conf = context["dag_run"].conf or {}
 
@@ -120,28 +135,56 @@ def preprocess_data(**context):
         "y_test": y_test.tolist(),
     }
 
-
+# context is a dictionary that contains information about the current execution context of the Airflow task. It provides access to various runtime parameters and allows tasks to communicate with each other through XComs (cross-communication). In this function, we use the context to retrieve the preprocessed data from the previous task and to log information about the model training process.
 def train_model(**context):
+    #ti stands for Task Instance,We use ti here to access XCom, which allows Airflow tasks to exchange small pieces of data.
     ti = context["ti"]
+    #Retrieve Preproccessed Data from XCom,The preprocess_data task returns a dictionary containing the training and testing datasets. We pull this data from XCom to use it for model training.
     data = ti.xcom_pull(task_ids="preprocess_data")
-
+    #Create the machine learning pipeline,The make_pipeline function from scikit-learn is used to create a machine learning pipeline. This pipeline consists of two steps: StandardScaler for feature scaling and LogisticRegression for classification. The max_iter parameter is set to 1000 to allow sufficient iterations for convergence, and random_state is set for reproducibility.
     model = make_pipeline(
         StandardScaler(),
         LogisticRegression(max_iter=1000, random_state=42),
     )
-
+    #Train the model,The model is trained using the fit method, which takes the training features (X_train) and labels (y_train) as input. This step adjusts the model parameters based on the training data. 
     model.fit(data["X_train"], data["y_train"])
+    #make predictions on the test set,After training, the model is used to make predictions on the test features (X_test). The predictions are converted to a list for easier handling and logging.
+    mlflow_run = mlflow_api_request(
+        "runs/create",
+        {
+            "experiment_id": MLFLOW_EXPERIMENT_ID,
+            "run_name": "customer-churn-training",
+        },
+    )
 
+    mlflow_run_id = mlflow_run["run"]["info"]["run_id"]
+
+    logging.info("MLflow Run ID: %s", mlflow_run_id)
+    for param_name, param_value in {
+        "algorithm": "LogisticRegression",
+        "max_iter": 1000,
+        "random_state": 42,
+    }.items():
+        mlflow_api_request(
+            "runs/log-parameter",
+            {
+                "run_id": mlflow_run_id,
+                "key": param_name,
+                "value": str(param_value),
+            },
+        )
     predictions = model.predict(data["X_test"]).tolist()
-
+    #Write logs for model training completion and predictions,Logging is used to provide information about the completion of model training and the predictions made on the test set. This helps in monitoring the pipeline's progress and debugging if necessary. 
     logging.info("Model training completed")
     logging.info("Predictions: %s", predictions)
-
+    #Return the predictions and model details,The function returns a dictionary containing the predictions made by the model, the algorithm used (Logistic Regression), and the maximum number of iterations set for the model. This information can be used in subsequent tasks for evaluation and analysis.
     return {
         "predictions": predictions,
         "algorithm": "LogisticRegression",
         "max_iter": 1000,
+        "mlflow_run_id": mlflow_run_id,
     }
+
 
 
 def evaluate_model(**context):
@@ -168,7 +211,31 @@ def evaluate_model(**context):
 
     logging.info("Model evaluation: %s", metrics)
 
+    mlflow_run_id = training["mlflow_run_id"]
+
+    for metric_name, metric_value in metrics.items():
+        mlflow_api_request(
+            "runs/log-metric",
+            {
+                "run_id": mlflow_run_id,
+                "key": metric_name,
+                "value": metric_value,
+                "timestamp": int(datetime.now().timestamp() * 1000),
+                "step": 0,
+            },
+        )
+
+    mlflow_api_request(
+        "runs/update",
+        {
+            "run_id": mlflow_run_id,
+            "status": "FINISHED",
+            "end_time": int(datetime.now().timestamp() * 1000),
+        },
+    )
+
     return metrics
+
 
 
 def quality_gate(**context):
