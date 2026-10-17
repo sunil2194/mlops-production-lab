@@ -137,28 +137,47 @@ def preprocess_data(**context):
         "y_test": y_test.tolist(),
     }
 
-# context is a dictionary that contains information about the current execution context of the Airflow task. It provides access to various runtime parameters and allows tasks to communicate with each other through XComs (cross-communication). In this function, we use the context to retrieve the preprocessed data from the previous task and to log information about the model training process.
+
 def train_model(**context):
-    #ti stands for Task Instance,We use ti here to access XCom, which allows Airflow tasks to exchange small pieces of data.
     ti = context["ti"]
-    #Retrieve Preproccessed Data from XCom,The preprocess_data task returns a dictionary containing the training and testing datasets. We pull this data from XCom to use it for model training.
     data = ti.xcom_pull(task_ids="preprocess_data")
-    #Create the machine learning pipeline,The make_pipeline function from scikit-learn is used to create a machine learning pipeline. This pipeline consists of two steps: StandardScaler for feature scaling and LogisticRegression for classification. The max_iter parameter is set to 1000 to allow sufficient iterations for convergence, and random_state is set for reproducibility.
+
+    # Train the model
     model = make_pipeline(
         StandardScaler(),
         LogisticRegression(max_iter=1000, random_state=42),
     )
-    #Train the model,The model is trained using the fit method, which takes the training features (X_train) and labels (y_train) as input. This step adjusts the model parameters based on the training data. 
     model.fit(data["X_train"], data["y_train"])
-    #make predictions on the test set,After training, the model is used to make predictions on the test features (X_test). The predictions are converted to a list for easier handling and logging.
-    
-    # Create a unique model file for this Airflow run
-   
-    mlflow_run_id = mlflow_run["run"]["info"]["run_id"]
 
+    # Save the model to S3
+    model_run_id = context["run_id"].replace("/", "_").replace(":", "_")
+    bucket = "mlops-dvc-sunil-20261007"
+    model_key = f"models/customer-churn/{model_run_id}/model.joblib"
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        model_path = os.path.join(temp_dir, "model.joblib")
+        joblib.dump(model, model_path)
+
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.upload_file(model_path, bucket, model_key)
+
+    model_s3_uri = f"s3://{bucket}/{model_key}"
+    logging.info("Trained model saved to %s", model_s3_uri)
+
+    # Create MLflow run
+    mlflow_run = mlflow_api_request(
+        "runs/create",
+        {
+            "experiment_id": MLFLOW_EXPERIMENT_ID,
+            "run_name": "customer-churn-training",
+            "start_time": int(datetime.now().timestamp() * 1000),
+        },
+    )
+
+    mlflow_run_id = mlflow_run["run"]["info"]["run_id"]
     logging.info("MLflow Run ID: %s", mlflow_run_id)
 
-    # Log model parameters to MLflow
+    # Log parameters
     for param_name, param_value in {
         "algorithm": "LogisticRegression",
         "max_iter": 1000,
@@ -173,28 +192,31 @@ def train_model(**context):
             },
         )
 
-    # Record the model's S3 location in MLflow
-    mlflow_api_request(
-        "runs/set-tag",
-        {
-            "run_id": mlflow_run_id,
-            "key": "model_s3_uri",
-            "value": model_s3_uri,
-        },
-    )
+    # Record model location and training library version
+    for tag_name, tag_value in {
+        "model_s3_uri": model_s3_uri,
+        "sklearn_version": "1.8.0",
+    }.items():
+        mlflow_api_request(
+            "runs/set-tag",
+            {
+                "run_id": mlflow_run_id,
+                "key": tag_name,
+                "value": tag_value,
+            },
+        )
 
-    # Record the scikit-learn version
-    mlflow_api_request(
-        "runs/set-tag",
-        {
-            "run_id": mlflow_run_id,
-            "key": "sklearn_version",
-            "value": "1.8.0",
-        },
-    )
-
-    # Predict using the trained model
     predictions = model.predict(data["X_test"]).tolist()
+
+    logging.info("Model training completed")
+    logging.info("Predictions: %s", predictions)
+
+    return {
+        "predictions": predictions,
+        "algorithm": "LogisticRegression",
+        "max_iter": 1000,
+        "mlflow_run_id": mlflow_run_id,
+    }
 
     logging.info("Model training completed")
     logging.info("Predictions: %s", predictions)
