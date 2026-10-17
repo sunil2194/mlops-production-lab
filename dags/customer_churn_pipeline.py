@@ -153,33 +153,12 @@ def train_model(**context):
     #make predictions on the test set,After training, the model is used to make predictions on the test features (X_test). The predictions are converted to a list for easier handling and logging.
     
     # Create a unique model file for this Airflow run
-    model_run_id = context["run_id"].replace("/", "_").replace(":", "_")
-
-    bucket = "mlops-dvc-sunil-20261007"
-    model_key = f"models/customer-churn/{model_run_id}/model.joblib"
-
-# Save the trained model temporarily
-    with tempfile.TemporaryDirectory() as temp_dir:
-       model_path = os.path.join(temp_dir, "model.joblib")
-       joblib.dump(model, model_path)
-
-       # Upload the trained model to S3
-       s3 = boto3.client("s3", region_name="us-east-1")
-       s3.upload_file(model_path, bucket, model_key)
-
-model_s3_uri = f"s3://{bucket}/{model_key}"
-logging.info("Trained model saved to %s", model_s3_uri)
-    mlflow_run = mlflow_api_request(
-        "runs/create",
-        {
-            "experiment_id": MLFLOW_EXPERIMENT_ID,
-            "run_name": "customer-churn-training",
-        },
-    )
-
+   
     mlflow_run_id = mlflow_run["run"]["info"]["run_id"]
 
     logging.info("MLflow Run ID: %s", mlflow_run_id)
+
+    # Log model parameters to MLflow
     for param_name, param_value in {
         "algorithm": "LogisticRegression",
         "max_iter": 1000,
@@ -193,28 +172,108 @@ logging.info("Trained model saved to %s", model_s3_uri)
                 "value": str(param_value),
             },
         )
-        mlflow_api_request("runs/set-tag", {
+
+    # Record the model's S3 location in MLflow
+    mlflow_api_request(
+        "runs/set-tag",
+        {
             "run_id": mlflow_run_id,
             "key": "model_s3_uri",
-            "value": model_s3_uri
-    })
+            "value": model_s3_uri,
+        },
+    )
 
-       mlflow_api_request("runs/set-tag", {
-           "run_id": mlflow_run_id,
-           "key": "sklearn_version",
-           "value": "1.8.0"
-    })
+    # Record the scikit-learn version
+    mlflow_api_request(
+        "runs/set-tag",
+        {
+            "run_id": mlflow_run_id,
+            "key": "sklearn_version",
+            "value": "1.8.0",
+        },
+    )
+
+    # Predict using the trained model
     predictions = model.predict(data["X_test"]).tolist()
-    #Write logs for model training completion and predictions,Logging is used to provide information about the completion of model training and the predictions made on the test set. This helps in monitoring the pipeline's progress and debugging if necessary. 
+
     logging.info("Model training completed")
     logging.info("Predictions: %s", predictions)
-    #Return the predictions and model details,The function returns a dictionary containing the predictions made by the model, the algorithm used (Logistic Regression), and the maximum number of iterations set for the model. This information can be used in subsequent tasks for evaluation and analysis.
+
     return {
         "predictions": predictions,
         "algorithm": "LogisticRegression",
         "max_iter": 1000,
         "mlflow_run_id": mlflow_run_id,
     }
+
+
+def evaluate_model(**context):
+    ti = context["ti"]
+
+    data = ti.xcom_pull(task_ids="preprocess_data")
+    training = ti.xcom_pull(task_ids="train_model")
+
+    actual = data["y_test"]
+    predicted = training["predictions"]
+
+    metrics = {
+        "accuracy": float(accuracy_score(actual, predicted)),
+        "precision": float(
+            precision_score(actual, predicted, zero_division=0)
+        ),
+        "recall": float(
+            recall_score(actual, predicted, zero_division=0)
+        ),
+        "f1": float(
+            f1_score(actual, predicted, zero_division=0)
+        ),
+    }
+
+    logging.info("Model evaluation: %s", metrics)
+
+    mlflow_run_id = training["mlflow_run_id"]
+
+    for metric_name, metric_value in metrics.items():
+        mlflow_api_request(
+            "runs/log-metric",
+            {
+                "run_id": mlflow_run_id,
+                "key": metric_name,
+                "value": metric_value,
+                "timestamp": int(datetime.now().timestamp() * 1000),
+                "step": 0,
+            },
+        )
+
+    mlflow_api_request(
+        "runs/update",
+        {
+            "run_id": mlflow_run_id,
+            "status": "FINISHED",
+            "end_time": int(datetime.now().timestamp() * 1000),
+        },
+    )
+
+    return metrics
+
+
+def quality_gate(**context):
+    ti = context["ti"]
+    metrics = ti.xcom_pull(task_ids="evaluate_model")
+
+    if not metrics:
+        raise AirflowException("No evaluation metrics available")
+
+    for name, value in metrics.items():
+        if not 0 <= value <= 1:
+            raise AirflowException(
+                f"Invalid metric {name}: {value}"
+            )
+
+    logging.info("Pipeline execution quality gate passed")
+    logging.info(
+        "Learning dataset only: model is not production-approved"
+    )
 
 
 
