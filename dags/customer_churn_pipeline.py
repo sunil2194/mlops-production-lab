@@ -5,7 +5,9 @@ import logging
 import json
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
-
+import os
+import tempfile
+import joblib
 import boto3
 import pandas as pd
 
@@ -149,6 +151,24 @@ def train_model(**context):
     #Train the model,The model is trained using the fit method, which takes the training features (X_train) and labels (y_train) as input. This step adjusts the model parameters based on the training data. 
     model.fit(data["X_train"], data["y_train"])
     #make predictions on the test set,After training, the model is used to make predictions on the test features (X_test). The predictions are converted to a list for easier handling and logging.
+    
+    # Create a unique model file for this Airflow run
+    model_run_id = context["run_id"].replace("/", "_").replace(":", "_")
+
+    bucket = "mlops-dvc-sunil-20261007"
+    model_key = f"models/customer-churn/{model_run_id}/model.joblib"
+
+# Save the trained model temporarily
+    with tempfile.TemporaryDirectory() as temp_dir:
+       model_path = os.path.join(temp_dir, "model.joblib")
+       joblib.dump(model, model_path)
+
+       # Upload the trained model to S3
+       s3 = boto3.client("s3", region_name="us-east-1")
+       s3.upload_file(model_path, bucket, model_key)
+
+model_s3_uri = f"s3://{bucket}/{model_key}"
+logging.info("Trained model saved to %s", model_s3_uri)
     mlflow_run = mlflow_api_request(
         "runs/create",
         {
@@ -173,6 +193,17 @@ def train_model(**context):
                 "value": str(param_value),
             },
         )
+        mlflow_api_request("runs/set-tag", {
+            "run_id": mlflow_run_id,
+            "key": "model_s3_uri",
+            "value": model_s3_uri
+    })
+
+       mlflow_api_request("runs/set-tag", {
+           "run_id": mlflow_run_id,
+           "key": "sklearn_version",
+           "value": "1.8.0"
+    })
     predictions = model.predict(data["X_test"]).tolist()
     #Write logs for model training completion and predictions,Logging is used to provide information about the completion of model training and the predictions made on the test set. This helps in monitoring the pipeline's progress and debugging if necessary. 
     logging.info("Model training completed")
