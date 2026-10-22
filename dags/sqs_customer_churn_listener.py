@@ -12,8 +12,8 @@ from airflow.providers.standard.operators.trigger_dagrun import (
 )
 
 QUEUE_URL = (
-    "https://sqs.us-east-1.amazonaws.com/"
-    "000515319532/mlops-customer-data-events"
+   "https://sqs.us-east-1.amazonaws.com/"
+    "000515319532/mlops-customer-churn-poc-queue"
 )
 
 REGION = "us-east-1"
