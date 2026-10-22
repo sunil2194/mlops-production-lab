@@ -6,6 +6,7 @@ Model files are stored in both S3 and MLflow run artifacts.
 """
 
 from datetime import datetime, timezone
+import hashlib
 from io import StringIO
 import json
 import logging
@@ -395,6 +396,22 @@ def log_and_register_model(**context):
     training = context["ti"].xcom_pull(task_ids="train_model")
     model_source = training["mlflow_package_uri"]
 
+    # Identify the exact dataset used by this Airflow run.
+    conf = context["dag_run"].conf or {}
+    bucket = conf.get("bucket", "mlops-dvc-sunil-20261007")
+    key = conf.get("key", "datasets/customer_data.csv")
+
+    s3 = boto3.client("s3", region_name="us-east-1")
+    dataset_bytes = s3.get_object(
+        Bucket=bucket,
+        Key=key,
+    )["Body"].read()
+
+    dataset_hash = hashlib.sha256(dataset_bytes).hexdigest()
+    metadata_uri = (
+        f"s3://{bucket}/dvc-metadata/{dataset_hash}.csv.dvc"
+    )
+
     # Create the model name if it does not exist.
     try:
         mlflow_api_request(
@@ -438,6 +455,18 @@ def log_and_register_model(**context):
                     "key": "model_s3_uri",
                     "value": training["model_s3_uri"],
                 },
+                {
+                    "key": "dataset_sha256",
+                    "value": dataset_hash,
+                },
+                {
+                    "key": "dataset_s3_uri",
+                    "value": f"s3://{bucket}/{key}",
+                },
+                {
+                    "key": "dvc_metadata_s3",
+                    "value": metadata_uri,
+                },
             ],
         },
     )
@@ -477,7 +506,7 @@ with DAG(
         task_id="version_dataset_with_dvc",
         name="customer-churn-dvc",
         namespace="airflow",
-        image="mlops-dvc:1.1",
+        image="mlops-dvc:1.2",
         image_pull_policy="Never",
         cmds=["python", "/app/scripts/version_dataset.py"],
         arguments=[

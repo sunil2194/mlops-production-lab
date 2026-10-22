@@ -79,6 +79,29 @@ def main():
         ),
     }
 
+    # Preserve DVC metadata outside the temporary Kubernetes pod.
+    s3 = boto3.client("s3", region_name="us-east-1")
+
+    metadata_key = f"dvc-metadata/{dataset_hash}.csv.dvc"
+    manifest_key = f"dvc-metadata/{dataset_hash}.json"
+
+    s3.upload_file(
+        metadata_path,
+        args.bucket,
+        metadata_key,
+    )
+
+    result["dvc_metadata_s3"] = f"s3://{args.bucket}/{metadata_key}"
+
+    s3.put_object(
+        Bucket=args.bucket,
+        Key=manifest_key,
+        Body=json.dumps(result, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+    print(f"Metadata saved: s3://{args.bucket}/{metadata_key}")
+    print(f"Manifest saved: s3://{args.bucket}/{manifest_key}")
     print(json.dumps(result, indent=2))
 
 
