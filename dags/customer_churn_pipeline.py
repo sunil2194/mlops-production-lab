@@ -23,6 +23,7 @@ import pandas as pd
 from airflow import DAG
 from airflow.exceptions import AirflowException
 from airflow.operators.python import PythonOperator
+from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
 from sklearn import __version__ as sklearn_version
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
@@ -472,6 +473,24 @@ with DAG(
         python_callable=load_customer_data,
     )
 
+    dvc = KubernetesPodOperator(
+        task_id="version_dataset_with_dvc",
+        name="customer-churn-dvc",
+        namespace="airflow",
+        image="mlops-dvc:1.1",
+        image_pull_policy="Never",
+        cmds=["python", "/app/scripts/version_dataset.py"],
+        arguments=[
+            "--bucket",
+            "{{ dag_run.conf.get('bucket', 'mlops-dvc-sunil-20261007') }}",
+            "--key",
+            "{{ dag_run.conf.get('key', 'datasets/customer_data.csv') }}",
+        ],
+        get_logs=True,
+        is_delete_operator_pod=True,
+        in_cluster=True,
+    )
+
     validate = PythonOperator(
         task_id="validate_data",
         python_callable=validate_data,
@@ -502,4 +521,4 @@ with DAG(
         python_callable=log_and_register_model,
     )
 
-    load >> validate >> preprocess >> train >> evaluate >> gate >> register
+    load >> dvc >> validate >> preprocess >> train >> evaluate >> gate >> register
